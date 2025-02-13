@@ -1,0 +1,387 @@
+Code config\database.php :
+<?php
+$host = 'bahixnsz3iv7yk6dhi8s-mysql.services.clever-cloud.com';
+$dbname = 'bahixnsz3iv7yk6dhi8s';
+$user = 'uxwgnyyqzuoqyffe';
+$pass = 'FlPcEI8TCG55oFNoKvdp';
+$api_key = 'y1xneVWfBv';
+
+try {
+  $pdo = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8", $user, $pass);
+  $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+} catch (PDOException $e) {
+  die("Database connection failed: " . $e->getMessage());
+}
+?>
+
+Code config\telegram_config.php :
+<?php
+$telegram_config = [
+    'bot_token' => '7422166185:AAGhIER-tM1bPLtUozN_E5-4fB8wlatrvQE',
+    'chat_id' => '2140071171' // ใส่ chat_id ที่ได้จากขั้นตอนก่อนหน้า
+];
+?>
+
+Code helpers\telegram_notify.php :
+<?php
+function sendTelegramNotification($message) {
+    global $telegram_config;
+    
+    $url = "https://api.telegram.org/bot{$telegram_config['bot_token']}/sendMessage";
+    
+    $data = [
+        'chat_id' => $telegram_config['chat_id'],
+        'text' => $message,
+        'parse_mode' => 'HTML'
+    ];
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    
+    $result = curl_exec($ch);
+    curl_close($ch);
+    
+    return $result;
+}
+?>
+
+Code api\sensors.php :
+<?php
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+header("Access-Control-Allow-Origin: *");
+header("Content-Type: application/json; charset=UTF-8");
+
+require __DIR__.'/../config/database.php';
+
+$response = ['status' => 'error', 'message' => 'Invalid request'];
+
+try {
+    $method = $_SERVER['REQUEST_METHOD'];
+    $apiKey = $_GET['api_key'] ?? '';
+    
+    if ($apiKey !== $api_key) {
+        throw new Exception('Unauthorized', 401);
+    }
+
+    switch ($method) {
+        case 'POST':
+            // อ่านข้อมูลจาก body ของ request
+            $data = json_decode(file_get_contents("php://input"), true);
+            
+            // ตรวจสอบว่า JSON ถูกต้องหรือไม่
+            if ($data === null) {
+                throw new Exception('Invalid JSON received', 400);
+            }
+
+            // ตรวจสอบว่า key ทุกตัวมีค่า
+            if (!isset($data['temperature'], $data['humidity'], $data['light_level'], $data['motion_detected'], $data['sound_level'])) {
+                throw new Exception('Missing required data', 400);
+            }
+
+            // บันทึกข้อมูลเซนเซอร์ลงฐานข้อมูล
+            $stmt = $pdo->prepare("
+                INSERT INTO sensors 
+                (temperature, humidity, light_level, motion_detected, sound_level)
+                VALUES (:temp, :hum, :light, :motion, :sound)
+            ");
+            
+            $stmt->execute([
+                ':temp' => $data['temperature'],
+                ':hum' => $data['humidity'],
+                ':light' => $data['light_level'],
+                ':motion' => $data['motion_detected'],
+                ':sound' => $data['sound_level']
+            ]);
+
+            // เรียกใช้ automation.php เพื่ออัปเดตสถานะอุปกรณ์
+            require __DIR__.'/automation.php';
+
+            // ส่งข้อมูลที่บันทึกสำเร็จ
+            $response = ['status' => 'success', 'message' => 'Data recorded'];
+            break;
+
+        case 'GET':
+            // ดึงข้อมูลเซนเซอร์ทั้งหมดจากฐานข้อมูล
+            $stmt = $pdo->query("SELECT * FROM sensors ORDER BY created_at DESC");
+            $sensors = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            // ส่งข้อมูลเซนเซอร์ทั้งหมด
+            $response = ['status' => 'success', 'data' => $sensors];
+            break;
+
+        default:
+            throw new Exception('Method not allowed', 405);
+    }
+} catch (Exception $e) {
+    http_response_code($e->getCode() ?: 500);
+    $response['message'] = $e->getMessage();
+}
+
+echo json_encode($response);
+
+Code api\devices.php :
+<?php
+header("Access-Control-Allow-Origin: *");
+header("Content-Type: application/json; charset=UTF-8");
+
+require __DIR__.'/../config/database.php';
+require __DIR__.'/../config/telegram_config.php'; 
+
+$response = ['status' => 'error', 'message' => 'Invalid request'];
+
+try {
+    $method = $_SERVER['REQUEST_METHOD'];
+    $apiKey = $_GET['api_key'] ?? '';
+
+    if ($apiKey !== $api_key) {
+        throw new Exception('Unauthorized', 401);
+    }
+
+    switch ($method) {
+        case 'GET':
+            // ดึงข้อมูลอุปกรณ์ทั้งหมด
+            $stmt = $pdo->query("SELECT * FROM devices");
+            $devices = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $response = ['status' => 'success', 'data' => $devices];
+            break;
+
+            case 'POST':
+                $data = json_decode(file_get_contents("php://input"), true);
+            
+                // ตรวจสอบค่าที่จำเป็น
+                if (!isset($data['action'], $data['device_id'], $data['status'])) {
+                    throw new Exception('Missing required data', 400);
+                }
+            
+                if ($data['action'] !== 'update') {
+                    throw new Exception('Invalid action', 400);
+                }
+            
+                // ตรวจสอบค่า device_id และ status
+                if (!is_numeric($data['device_id']) || !in_array($data['status'], [0, 1])) {
+                    throw new Exception('Invalid device_id or status', 400);
+                }
+            
+                // ตรวจสอบว่าอุปกรณ์มีอยู่จริงหรือไม่
+                $stmt = $pdo->prepare("SELECT COUNT(*) FROM devices WHERE id = :id");
+                $stmt->execute([':id' => $data['device_id']]);
+                if ($stmt->fetchColumn() == 0) {
+                    throw new Exception('Device not found', 404);
+                }
+            
+                // อัปเดตสถานะอุปกรณ์
+                $manualOverride = isset($data['manual_override']) ? (int)$data['manual_override'] : 0; // แปลงเป็น integer (0 หรือ 1)
+                $stmt = $pdo->prepare("UPDATE devices 
+                    SET status = :status, 
+                        last_updated = NOW(), 
+                        manual_override = :manual_override 
+                    WHERE id = :id");
+            
+                $stmt->bindParam(':id', $data['device_id'], PDO::PARAM_INT);
+                $stmt->bindParam(':status', $data['status'], PDO::PARAM_INT);
+                $stmt->bindParam(':manual_override', $manualOverride, PDO::PARAM_INT);
+                $stmt->execute();
+            
+                $response = ['status' => 'success', 'message' => 'Device updated', 'manual_override' => $manualOverride];
+                break;
+
+        default:
+            throw new Exception('Method not allowed', 405);
+    }
+} catch (Exception $e) {
+    http_response_code($e->getCode() ?: 500);
+    $response['message'] = $e->getMessage();
+}
+
+echo json_encode($response);
+?>
+
+Code api\automation.php :
+<?php
+require __DIR__.'/../config/database.php';
+require __DIR__.'/../config/telegram_config.php';
+require __DIR__.'/../helpers/telegram_notify.php';
+
+// กำหนดค่าคงที่
+define('TEMP_HIGH', 31.0);      // อุณหภูมิสูงสุด
+define('TEMP_LOW', 31.0);       // อุณหภูมิต่ำสุด
+define('LIGHT_THRESHOLD', 2000);  // ค่าแสงน้อย
+define('MOTION_THRESHOLD', 3000); // ค่าการเคลื่อนไหว
+define('SOUND_THRESHOLD', 3000);  // ค่าเสียง
+
+class HomeAutomation {
+    private $pdo;
+    private $sensor;
+    private $devices;
+    private $newStatus = [];
+
+    // กำหนด ID อุปกรณ์เป็นค่าคงที่
+    const DEVICE_LIGHT = 1; // ไฟนอกบ้าน
+    const DEVICE_INDOOR_LIGHT = 2; // ไฟในบ้าน
+    const DEVICE_FAN = 3; // พัดลม
+
+    public function __construct($pdo) {
+        $this->pdo = $pdo;
+    }
+
+    private function getSensorData() {
+        $stmt = $this->pdo->prepare("SELECT * FROM sensors ORDER BY created_at DESC LIMIT 1");
+        $stmt->execute();
+        $this->sensor = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$this->sensor) {
+            throw new Exception("No sensor data available");
+        }
+    }
+
+    private function getDevices() {
+        $stmt = $this->pdo->prepare("SELECT * FROM devices");
+        $stmt->execute();
+        $this->devices = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    private function checkTemperature() {
+        if ($this->sensor['temperature'] > TEMP_HIGH) {
+            $this->newStatus[self::DEVICE_FAN] = 1; // เปิดพัดลม
+            sendTelegramNotification(
+                "🌡️ <b>แจ้งเตือนอุณหภูมิสูง</b>\n" .
+                "อุณหภูมิ: {$this->sensor['temperature']}°C\n" .
+                "การทำงาน: เปิดพัดลมอัตโนมัติ"
+            );
+        } elseif ($this->sensor['temperature'] < TEMP_LOW) {
+            $this->newStatus[self::DEVICE_FAN] = 0; // ปิดพัดลม
+        }
+    }
+
+    private function checkLight() {
+        if ($this->sensor['light_level'] < LIGHT_THRESHOLD) {
+            $this->newStatus[self::DEVICE_LIGHT] = 1; // เปิดไฟนอกบ้าน
+            sendTelegramNotification(
+                "💡 <b>แจ้งเตือนแสงสว่าง</b>\n" .
+                "ระดับแสง: {$this->sensor['light_level']}\n" .
+                "การทำงาน: เปิดไฟนอกบ้านอัตโนมัติ"
+            );
+        } else {
+            $this->newStatus[self::DEVICE_LIGHT] = 0; // ปิดไฟนอกบ้าน
+        }
+    }
+
+    private function checkMotion() {
+        if ($this->sensor['motion_detected'] > MOTION_THRESHOLD) {
+            $this->newStatus[self::DEVICE_INDOOR_LIGHT] = 1; // เปิดไฟในบ้าน
+            sendTelegramNotification(
+                "🚨 <b>แจ้งเตือนตรวจพบการเคลื่อนไหว</b>\n" .
+                "ค่าการเคลื่อนไหว: {$this->sensor['motion_detected']}\n" .
+                "การทำงาน: เปิดไฟในบ้านอัตโนมัติ"
+            );
+        } else {
+            $this->newStatus[self::DEVICE_INDOOR_LIGHT] = 0; // ปิดไฟในบ้าน
+        }
+    }
+
+    private function checkSound() {
+        if ($this->sensor['sound_level'] > SOUND_THRESHOLD) {
+            $this->newStatus[self::DEVICE_FAN] = 1; // เปิดพัดลม
+            $this->newStatus[self::DEVICE_INDOOR_LIGHT] = 1; // เปิดไฟในบ้าน
+
+            sendTelegramNotification(
+                "📢 <b>แจ้งเตือนเสียงดัง</b>\n" .
+                "ระดับเสียง: {$this->sensor['sound_level']}\n" .
+                "การทำงาน: เปิดไฟและพัดลมอัตโนมัติ"
+            );
+
+            // ตั้งเวลาปิดอัตโนมัติ 5 วินาที
+            $this->pdo->prepare(
+                "UPDATE devices SET auto_off_time = DATE_ADD(NOW(), INTERVAL 5 SECOND) WHERE id IN (?, ?)"
+            )->execute([self::DEVICE_FAN, self::DEVICE_INDOOR_LIGHT]);
+        }
+    }
+
+    private function checkAutoOffDevices() {
+        $stmt = $this->pdo->query("SELECT id FROM devices WHERE auto_off_time <= NOW()");
+        $expiredDevices = $stmt->fetchAll(PDO::FETCH_COLUMN);
+
+        foreach ($expiredDevices as $id) {
+            $this->newStatus[$id] = 0; // ปิดอุปกรณ์
+            $this->pdo->prepare("UPDATE devices SET auto_off_time = NULL WHERE id = ?")->execute([$id]);
+
+            sendTelegramNotification(
+                "⏲️ <b>แจ้งเตือนปิดอัตโนมัติ</b>\n" .
+                "อุปกรณ์ ID: $id ถูกปิดตามเวลาที่กำหนด"
+            );
+        }
+    }
+
+    private function updateDevices() {
+        $stmt = $this->pdo->prepare("
+            UPDATE devices 
+            SET status = :status, 
+                last_updated = NOW() 
+            WHERE id = :id AND status != :status AND manual_override = 0
+        ");
+    
+        foreach ($this->devices as $device) {
+            // ตรวจสอบค่า manual_override เป็น 0 หรือ 1
+            if (isset($this->newStatus[$device['id']]) && $device['manual_override'] == 0) {
+                $stmt->execute([
+                    ':status' => $this->newStatus[$device['id']],
+                    ':id' => $device['id']
+                ]);
+            }
+        }
+    }
+
+    public function run() {
+        try {
+            $this->pdo->beginTransaction();
+
+            $this->getSensorData();
+            $this->getDevices();
+
+            // ตรวจสอบเงื่อนไขต่างๆ
+            $this->checkTemperature();
+            $this->checkLight();
+            $this->checkMotion();
+            $this->checkSound();
+            $this->checkAutoOffDevices();
+
+            // อัปเดตอุปกรณ์
+            $this->updateDevices();
+
+            $this->pdo->commit();
+
+            return [
+                'status' => 'success',
+                'message' => 'Device states updated successfully',
+                'updates' => $this->newStatus
+            ];
+
+        } catch (Exception $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+
+            error_log("Automation error: " . $e->getMessage());
+
+            sendTelegramNotification(
+                "⚠️ <b>แจ้งเตือนข้อผิดพลาด</b>\n" .
+                "ข้อผิดพลาด: {$e->getMessage()}"
+            );
+
+            return [
+                'status' => 'error',
+                'message' => 'Automation update failed: ' . $e->getMessage()
+            ];
+        }
+    }
+}
+
+// รันระบบ
+$automation = new HomeAutomation($pdo);
+echo json_encode($automation->run());
+?>
